@@ -1,0 +1,24 @@
+[project]
+name = "llm-firewall"
+version = "0.1.0"
+description = "TLS-intercepting logging proxy for inspecting LLM/app HTTPS traffic"
+readme = "README.md"
+requires-python = ">=3.13"
+dependencies = [
+    "mitmproxy>=11.0.0",
+    # cryptography 48.x bundles OpenSSL 4.0, whose memory-BIO SSL_write behavior
+    # crashes mitmproxy 12's TLS passthrough with "memory buffer routines: passed
+    # invalid argument". Pin to the last OpenSSL 3.5.x build (47.x) until mitmproxy
+    # supports OpenSSL 4.0.
+    "cryptography<47",
+]
+
+[project.scripts]
+llm-firewall = "llm_firewall.run_proxy:main"
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[tool.hatch.build.targets.wheel]
+packages = ["llm_firewall"]
