@@ -1,0 +1,8 @@
+# Field selectors: which JSON body values are sent to the privacy filter.
+# One selector per line. A segment ending in `[]` descends into each item of a
+# list; the final segment names the string value(s) to redact. Selectors are
+# matched only inside the JSON request body — a body matching none of them is
+# forwarded unfiltered. Blank lines and `#` comments are ignored.
+
+# OpenAI / Anthropic style chat completions
+messages[].content[].text

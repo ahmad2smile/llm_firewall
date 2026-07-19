@@ -15,6 +15,10 @@ dependencies = [
 
 [project.scripts]
 llm-firewall = "llm_firewall.run_proxy:main"
+llm-firewall-dashboard = "llm_firewall.dashboard:main"
+
+[dependency-groups]
+dev = ["pytest>=8.3"]
 
 [build-system]
 requires = ["hatchling"]

@@ -27,6 +27,15 @@ CA_CER = CA_DIR / "mitmproxy-ca-cert.cer"
 
 _INTERNET_SETTINGS = r"Software\Microsoft\Windows\CurrentVersion\Internet Settings"
 
+# Node/Electron runtimes ship their own CA bundle and ignore the OS Root store,
+# so trusting the mitmproxy CA there means pointing NODE_EXTRA_CA_CERTS at a PEM
+# file. That variable takes a single file, so we bundle every cert under the
+# project's certs/ dir into one PEM (kept next to the CA, outside the repo).
+NODE_CA_ENV = "NODE_EXTRA_CA_CERTS"
+NODE_CA_BUNDLE = CA_DIR / "llm-firewall-node-ca-bundle.pem"
+_USER_ENV_SUBKEY = "Environment"  # HKCU\Environment holds user-level env vars
+_CERT_SUFFIXES = {".pem", ".crt", ".cer", ".der", ".p12", ".pfx"}
+
 
 # --------------------------------------------------------------------------- #
 # CA trust
@@ -216,3 +225,162 @@ def restore_system_proxy(previous: dict) -> None:
         )
     _refresh_wininet()
     logger.info("System proxy restored.")
+
+
+# --------------------------------------------------------------------------- #
+# NODE_EXTRA_CA_CERTS (user-level env var for Node/Electron trust)
+# --------------------------------------------------------------------------- #
+
+def _pem_certs_from_file(path: Path) -> list[bytes]:
+    """Return each certificate in a file as a PEM block (converting DER/PKCS12)."""
+    from cryptography import x509
+    from cryptography.hazmat.primitives.serialization import Encoding, pkcs12
+
+    data = path.read_bytes()
+    try:
+        if path.suffix.lower() in (".p12", ".pfx"):
+            # CA-only exports keep the cert in additional_certificates, so take
+            # both the main cert (if any) and the extras.
+            _key, cert, extra = pkcs12.load_key_and_certificates(data, None)
+            certs = ([cert] if cert else []) + list(extra or [])
+        elif b"-----BEGIN CERTIFICATE-----" in data:
+            certs = x509.load_pem_x509_certificates(data)  # may hold several
+        else:
+            certs = [x509.load_der_x509_certificate(data)]
+        return [c.public_bytes(Encoding.PEM) for c in certs]
+    except Exception as exc:
+        logger.warning("skipping %s (not a readable certificate): %s", path.name, exc)
+        return []
+
+
+def build_node_ca_bundle(certs_dir: Path, bundle_path: Path | None = None) -> int:
+    """Concatenate every cert under ``certs_dir`` into one PEM bundle.
+
+    Returns the number of unique certificates written (0 if none were found, in
+    which case no bundle file is created).
+    """
+    if bundle_path is None:
+        bundle_path = NODE_CA_BUNDLE
+    if not certs_dir.is_dir():
+        logger.warning("certs dir %s not found; NODE_EXTRA_CA_CERTS not set", certs_dir)
+        return 0
+    seen: set[bytes] = set()
+    pems: list[bytes] = []
+    for path in sorted(certs_dir.iterdir()):
+        if not path.is_file() or path.suffix.lower() not in _CERT_SUFFIXES:
+            continue
+        for pem in _pem_certs_from_file(path):
+            norm = pem.strip()
+            if norm and norm not in seen:
+                seen.add(norm)
+                pems.append(norm)
+    if not pems:
+        return 0
+    bundle_path.parent.mkdir(parents=True, exist_ok=True)
+    bundle_path.write_bytes(b"\n".join(pems) + b"\n")
+    return len(pems)
+
+
+def _get_user_env(name: str) -> str | None:
+    import winreg
+
+    try:
+        with winreg.OpenKey(winreg.HKEY_CURRENT_USER, _USER_ENV_SUBKEY) as key:
+            return winreg.QueryValueEx(key, name)[0]
+    except FileNotFoundError:
+        return None
+
+
+def _set_user_env(name: str, value: str) -> None:
+    import winreg
+
+    with winreg.OpenKey(
+        winreg.HKEY_CURRENT_USER, _USER_ENV_SUBKEY, 0, winreg.KEY_SET_VALUE
+    ) as key:
+        winreg.SetValueEx(key, name, 0, winreg.REG_SZ, value)
+    _broadcast_env_change()
+
+
+def _del_user_env(name: str) -> None:
+    import winreg
+
+    try:
+        with winreg.OpenKey(
+            winreg.HKEY_CURRENT_USER, _USER_ENV_SUBKEY, 0, winreg.KEY_SET_VALUE
+        ) as key:
+            winreg.DeleteValue(key, name)
+    except FileNotFoundError:
+        return
+    _broadcast_env_change()
+
+
+def _broadcast_env_change() -> None:
+    """Notify Explorer so processes launched afterwards inherit the new value.
+
+    A user-level env var written to the registry is only seen by processes that
+    start *after* this broadcast (an already-open shell keeps its old copy).
+    """
+    import ctypes
+
+    HWND_BROADCAST = 0xFFFF
+    WM_SETTINGCHANGE = 0x001A
+    SMTO_ABORTIFHUNG = 0x0002
+    result = ctypes.c_ulong()
+    ctypes.windll.user32.SendMessageTimeoutW(
+        HWND_BROADCAST,
+        WM_SETTINGCHANGE,
+        0,
+        ctypes.c_wchar_p(_USER_ENV_SUBKEY),
+        SMTO_ABORTIFHUNG,
+        5000,
+        ctypes.byref(result),
+    )
+
+
+def enable_node_extra_ca_certs(certs_dir: Path) -> tuple[str | None, bool]:
+    """Point NODE_EXTRA_CA_CERTS at a bundle of ``certs_dir``'s certificates.
+
+    Returns ``(previous_value, changed)``. When ``changed`` is True the caller
+    must pass ``previous_value`` to :func:`restore_node_extra_ca_certs` at
+    shutdown. A no-op (returns ``(None, False)``) when no certs are found or on
+    non-Windows, where the export line is printed instead.
+    """
+    count = build_node_ca_bundle(certs_dir)
+    if count == 0:
+        return None, False
+    if not WINDOWS:
+        print(
+            f'>>> For Node/Electron apps, run: export {NODE_CA_ENV}="{NODE_CA_BUNDLE}"'
+        )
+        return None, False
+    previous = _get_user_env(NODE_CA_ENV)
+    if previous == str(NODE_CA_BUNDLE):
+        # A prior run left it set (e.g. hard-killed before restore); treat as
+        # unchanged so we don't later "restore" our own bundle as the baseline.
+        logger.info("%s already set to %s (%d cert(s)).", NODE_CA_ENV, NODE_CA_BUNDLE, count)
+        return previous, False
+    _set_user_env(NODE_CA_ENV, str(NODE_CA_BUNDLE))
+    logger.info("%s set to %s (%d cert(s)).", NODE_CA_ENV, NODE_CA_BUNDLE, count)
+    return previous, True
+
+
+def restore_node_extra_ca_certs(previous: str | None) -> None:
+    """Undo :func:`enable_node_extra_ca_certs`, restoring any prior value."""
+    if not WINDOWS:
+        return
+    if previous is None:
+        _del_user_env(NODE_CA_ENV)
+    else:
+        _set_user_env(NODE_CA_ENV, previous)
+    logger.info("%s restored.", NODE_CA_ENV)
+
+
+def clear_node_extra_ca_certs() -> None:
+    """Best-effort teardown for ``--restore``: drop the var if it's ours, delete bundle."""
+    if WINDOWS and _get_user_env(NODE_CA_ENV) == str(NODE_CA_BUNDLE):
+        _del_user_env(NODE_CA_ENV)
+        logger.info("%s cleared.", NODE_CA_ENV)
+    try:
+        NODE_CA_BUNDLE.unlink()
+    except FileNotFoundError:
+        pass

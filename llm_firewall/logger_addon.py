@@ -23,6 +23,23 @@ from mitmproxy import http
 
 logger = logging.getLogger("llm_firewall")
 
+# Bodies larger than this (decoded chars) are not stored in full. Without a cap a
+# single YouTube video chunk — megabytes of base64 — bloats capture.jsonl into
+# gigabytes and makes the dashboard that reads it unusably slow. Real LLM/API JSON
+# is far smaller than this, so it is logged intact; only big or binary payloads
+# are replaced with a short marker.
+MAX_LOGGED_BODY = 512 * 1024
+
+
+def _cap_body(text: str | None, is_base64: bool) -> tuple[str | None, bool, bool]:
+    """Return (body, is_base64, truncated). Oversized bodies become a marker."""
+    if text is None or len(text) <= MAX_LOGGED_BODY:
+        return text, is_base64, False
+    if is_base64:
+        raw_bytes = len(text) * 3 // 4
+        return f"<{raw_bytes} bytes binary — not logged>", False, True
+    return text[:MAX_LOGGED_BODY] + f"\n… <truncated, {len(text)} chars total>", False, True
+
 
 def capture_dir() -> Path:
     """Resolve the capture directory (XAI_CAPTURE_DIR, else ~/llm-firewall-capture)."""
@@ -123,11 +140,19 @@ class RequestLogger:
             "client": flow.client_conn.peername[0] if flow.client_conn.peername else None,
             "error": str(flow.error) if flow.error else None,
         }
+        # Counters left by the privacy addon. For redacted flows the logged
+        # request body is what actually went upstream; for BLOCKED flows
+        # (privacy_blocked) it is the client's original body, which never left
+        # the machine. Responses are logged in their restored form.
+        for key in ("privacy_redactions", "privacy_restored", "privacy_blocked"):
+            value = flow.metadata.get(key)
+            if value is not None:
+                record[key] = value
         req = flow.request
         # In the error() hook a flow can arrive before its request was parsed
         # (TLS/connection failures), so flow.request may be None — guard it.
         if req is not None:
-            req_text, req_b64 = self._decode_body(req)
+            req_text, req_b64, req_trunc = _cap_body(*self._decode_body(req))
             record["request"] = {
                 "method": req.method,
                 "scheme": req.scheme,
@@ -140,9 +165,18 @@ class RequestLogger:
                 "body": req_text,
                 "body_is_base64": req_b64,
             }
+            if req_trunc:
+                record["request"]["body_truncated"] = True
+            # Pre-redaction body, present only when the privacy addon changed it.
+            # ``body`` is what went upstream; ``body_original`` is what the client
+            # sent — the before/after the dashboard renders.
+            original = flow.metadata.get("privacy_request_original_body")
+            if original is not None:
+                capped, _, _ = _cap_body(original, False)
+                record["request"]["body_original"] = capped
         if flow.response is not None:
             resp = flow.response
-            resp_text, resp_b64 = self._decode_body(resp)
+            resp_text, resp_b64, resp_trunc = _cap_body(*self._decode_body(resp))
             record["response"] = {
                 "status_code": resp.status_code,
                 "reason": resp.reason,
@@ -151,6 +185,15 @@ class RequestLogger:
                 "body": resp_text,
                 "body_is_base64": resp_b64,
             }
+            if resp_trunc:
+                record["response"]["body_truncated"] = True
+            # Pre-restoration body (still holding placeholders), present only when
+            # the privacy addon restored something. ``body`` is what the local app
+            # saw; ``body_original`` is what upstream actually returned.
+            original = flow.metadata.get("privacy_response_original_body")
+            if original is not None:
+                capped, _, _ = _cap_body(original, False)
+                record["response"]["body_original"] = capped
         return record
 
     # ---- mitmproxy hooks -------------------------------------------------
@@ -184,20 +227,9 @@ class RequestLogger:
         flow_path.write_text(
             json.dumps(record, ensure_ascii=False, indent=2), encoding="utf-8"
         )
-
-        status = record.get("response", {}).get("status_code", "ERR")
-        body = req.get("body")
-        if req.get("body_is_base64"):
-            # len(body) is base64 chars; the source is ~3/4 that many bytes.
-            raw_bytes = len(body) * 3 // 4 if body else 0
-            preview = f"<{raw_bytes}B base64>" if body else ""
-        elif body:
-            preview = body
-        else:
-            preview = ""
-        logger.info(
-            "%s %s\n %s -> %s", req.get("method", "-"), host, preview, status
-        )
+        # Per-flow traffic is intentionally NOT logged to the terminal — browse it
+        # in the review dashboard instead (see dashboard.py). Only warnings/errors
+        # (e.g. from the privacy filter) still reach the console.
 
 
 # mitmproxy discovers module-level `addons`.
