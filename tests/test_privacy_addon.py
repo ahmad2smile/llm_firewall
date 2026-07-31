@@ -455,6 +455,160 @@ def test_response_restore_sse_with_json_escaping():
     assert json.loads(line.removeprefix("data: "))["delta"] == 'say "hi" done'
 
 
+def _sse_contents(body: bytes) -> str:
+    """Concatenate the OpenAI-style delta.content across an SSE body."""
+    out = []
+    for line in body.decode().splitlines():
+        payload = line.removeprefix("data: ").strip()
+        if not payload or payload == "[DONE]":
+            continue
+        out.append(json.loads(payload)["choices"][0]["delta"]["content"])
+    return "".join(out)
+
+
+def test_response_restore_sse_placeholder_split_across_frames():
+    # A placeholder streamed token-by-token: "[" arrives in one frame and the
+    # rest in the next, so it is never contiguous in the raw body.
+    addon = make_addon()
+    addon._redacted_hosts.add("api.example.com")
+    occ = addon.cache.placeholder("occupation", "Doctor")  # [OCCUPATION_1]
+    last = addon.cache.placeholder("last_name", "Smith")  # [LAST_NAME_1]
+    flow = make_flow({}, resp=True)
+    flow.response.headers["content-type"] = "text/event-stream"
+    frame = lambda c: 'data: %s\n\n' % json.dumps(
+        {"choices": [{"delta": {"content": c}}]}
+    )
+    flow.response.content = (
+        frame("You are a [")
+        + frame(occ[1:] + " and a " + last)  # "OCCUPATION_1] and a [LAST_NAME_1]"
+        + "data: [DONE]\n\n"
+    ).encode()
+    addon.response(flow)
+
+    # The user-visible reassembled stream has both originals, no placeholders.
+    assert _sse_contents(flow.response.content) == "You are a Doctor and a Smith"
+    assert flow.metadata["privacy_restored"] == 2
+
+
+def test_response_restore_ndjson_split_across_lines():
+    addon = make_addon()
+    addon._redacted_hosts.add("api.example.com")
+    email = addon.cache.placeholder("email", "jdoe@example.com")  # [EMAIL_1]
+    flow = make_flow({}, resp=True)
+    flow.response.headers["content-type"] = "application/x-ndjson"
+    head, tail = email[:4], email[4:]  # "[EMA", "IL_1]"
+    flow.response.content = (
+        json.dumps({"t": "mail " + head}) + "\n" + json.dumps({"t": tail}) + "\n"
+    ).encode()
+    addon.response(flow)
+
+    joined = "".join(
+        json.loads(line)["t"] for line in flow.response.content.decode().splitlines()
+    )
+    assert joined == "mail jdoe@example.com"
+    assert flow.metadata["privacy_restored"] == 1
+
+
+def _openai_frame(content: str) -> str:
+    """A realistic OpenAI chunk carrying id/object/model beside the content delta."""
+    return "data: %s\n\n" % json.dumps(
+        {
+            "id": "chatcmpl-abc",
+            "object": "chat.completion.chunk",
+            "model": "gpt-4o",
+            "choices": [{"index": 0, "delta": {"content": content}}],
+        }
+    )
+
+
+def test_response_restore_sse_split_with_interleaved_metadata():
+    # Real provider frames repeat id/object/model every chunk, so consecutive
+    # content deltas are NOT adjacent in the body. Restoration must reassemble by
+    # field path, not by naively concatenating every string value in the frames.
+    addon = make_addon()
+    addon._redacted_hosts.add("api.example.com")
+    occ = addon.cache.placeholder("occupation", "Doctor")  # [OCCUPATION_1]
+    flow = make_flow({}, resp=True)
+    flow.response.headers["content-type"] = "text/event-stream"
+    flow.response.content = (
+        _openai_frame("You are a [") + _openai_frame(occ[1:]) + "data: [DONE]\n\n"
+    ).encode()
+    addon.response(flow)
+
+    assert _sse_contents(flow.response.content) == "You are a Doctor"
+    assert flow.metadata["privacy_restored"] == 1
+
+
+def test_response_restore_does_not_join_unrelated_fields():
+    # Two independent fields that happen to abut as "[EMAIL" + "_1]" must NOT be
+    # spliced into a placeholder — that would inject PII into one and truncate
+    # the other. Fields at different paths are reassembled separately.
+    addon = make_addon()
+    addon._redacted_hosts.add("api.example.com")
+    addon.cache.placeholder("email", "jdoe@example.com")  # [EMAIL_1]
+    flow = make_flow({}, resp=True)
+    flow.response.headers["content-type"] = "text/event-stream"
+    flow.response.content = (
+        "data: %s\n\n"
+        % json.dumps({"id": "z[EMAIL", "choices": [{"delta": {"content": "_1] hi"}}]})
+    ).encode()
+    addon.response(flow)
+
+    frame = json.loads(flow.response.content.decode().splitlines()[0].removeprefix("data: "))
+    assert frame["id"] == "z[EMAIL"  # untouched
+    assert frame["choices"][0]["delta"]["content"] == "_1] hi"  # untouched
+    assert "privacy_restored" not in flow.metadata
+
+
+def test_response_restore_sse_non_json_line():
+    # A plain-text SSE line among JSON frames still gets whole placeholders
+    # restored (it is not skipped just because other lines are JSON).
+    addon = make_addon()
+    addon._redacted_hosts.add("api.example.com")
+    name = addon.cache.placeholder("name", "Jane")  # [NAME_1]
+    flow = make_flow({}, resp=True)
+    flow.response.headers["content-type"] = "text/event-stream"
+    flow.response.content = (
+        'data: {"v": 1}\n\ndata: hello %s\n\n' % name
+    ).encode()
+    addon.response(flow)
+
+    assert b"hello Jane" in flow.response.content
+    assert flow.metadata["privacy_restored"] == 1
+
+
+def test_response_restore_sse_preserves_crlf():
+    addon = make_addon()
+    addon._redacted_hosts.add("api.example.com")
+    email = addon.cache.placeholder("email", "x@y.com")  # [EMAIL_1]
+    flow = make_flow({}, resp=True)
+    flow.response.headers["content-type"] = "text/event-stream"
+    flow.response.content = ('data: %s\r\n\r\n' % json.dumps({"v": email})).encode()
+    addon.response(flow)
+
+    text = flow.response.content.decode()
+    assert "x@y.com" in text
+    assert text.startswith("data: ") and "\r\n" in text  # CRLF framing kept
+
+
+def test_response_restore_large_body_without_placeholder_is_fast():
+    # A multi-MB streamed body with a bare "[" but no known placeholder must
+    # early-out instead of doing quadratic work on the event loop.
+    import time
+
+    addon = make_addon()
+    addon._redacted_hosts.add("api.example.com")
+    addon.cache.placeholder("email", "x@y.com")  # cache non-empty
+    flow = make_flow({}, resp=True)
+    flow.response.headers["content-type"] = "application/x-ndjson"
+    big = "x" * (4 * 1024 * 1024) + "["
+    flow.response.content = (json.dumps({"t": big}) + "\n").encode()
+    start = time.monotonic()
+    addon.response(flow)
+    assert time.monotonic() - start < 2.0
+    assert "privacy_restored" not in flow.metadata
+
+
 def test_response_restore_xml_escaped():
     addon = make_addon()
     prime(addon)

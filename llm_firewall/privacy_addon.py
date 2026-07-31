@@ -40,6 +40,7 @@ http://127.0.0.1:8080/v1/filter, threshold 0.5, fail-closed):
 from __future__ import annotations
 
 import asyncio
+import bisect
 import json
 import logging
 import re
@@ -150,6 +151,54 @@ def _map_strings(obj: object, fn) -> tuple[object, int]:
             total += n
         return out_dict, total
     return obj, 0
+
+
+def _iter_json_string_paths(obj: object, path: tuple):
+    """Yield ``(path, string)`` for every string value, in ``_rebuild_json_strings`` order.
+
+    ``path`` is the tuple of keys/indices from the root, so the same logical
+    field across successive stream frames (e.g. ``('choices', 0, 'delta',
+    'content')``) shares a path and can be reassembled on its own — never joined
+    to a sibling field (``id``, ``model``) or a different list element.
+    """
+    if isinstance(obj, str):
+        yield path, obj
+    elif isinstance(obj, list):
+        for i, item in enumerate(obj):
+            yield from _iter_json_string_paths(item, path + (i,))
+    elif isinstance(obj, dict):
+        for key, value in obj.items():
+            yield from _iter_json_string_paths(value, path + (key,))
+
+
+def _rebuild_json_strings(obj: object, values) -> object:
+    """Rebuild a JSON tree, replacing each string with the next item from ``values``."""
+    if isinstance(obj, str):
+        return next(values)
+    if isinstance(obj, list):
+        return [_rebuild_json_strings(item, values) for item in obj]
+    if isinstance(obj, dict):
+        return {key: _rebuild_json_strings(value, values) for key, value in obj.items()}
+    return obj
+
+
+# Matches a stream frame line and splits off an optional ``data:`` (SSE) prefix
+# from its payload; NDJSON lines have no prefix. The payload is JSON when it
+# starts with ``{`` or ``[`` and parses — ``data: [DONE]`` and blank lines fail
+# this and are passed through untouched.
+_STREAM_DATA_RE = re.compile(r"(data:\s*)(.*)$", re.DOTALL)
+
+
+def _parse_stream_json_line(line: str) -> tuple[str, object] | None:
+    """Split a stream line into ``(prefix, json_obj)``, or None if it is not JSON."""
+    match = _STREAM_DATA_RE.match(line)
+    prefix, payload = (match.group(1), match.group(2)) if match else ("", line)
+    if payload.lstrip()[:1] not in ("{", "["):
+        return None
+    try:
+        return prefix, json.loads(payload)
+    except ValueError:
+        return None
 
 
 # ---- schema field selectors ---------------------------------------------
@@ -331,6 +380,55 @@ class EntityCache:
 
         return PLACEHOLDER_RE.sub(swap, text), count
 
+    def restore_segments(self, segments: list[str]) -> tuple[list[str], int]:
+        """Restore placeholders that may span a *sequence* of string segments.
+
+        The segments are concatenated, matched against the cache as one text,
+        and rebuilt — so a placeholder streamed in pieces across frames (e.g.
+        ``[`` in one SSE delta and ``OCCUPATION_10]`` in the next) is still
+        recognised. Each restored value is attributed to the segment that held
+        the placeholder's opening ``[``; the overlapped tail segments simply
+        drop their share. Unknown placeholders are left untouched.
+
+        Runs in O(total length) — it copies whole slices between matches rather
+        than character by character, so a multi-megabyte segment costs a memcpy,
+        not a quadratic rebuild on the proxy's event loop.
+        """
+        buffer = "".join(segments)
+        matches = [
+            m
+            for m in PLACEHOLDER_RE.finditer(buffer)
+            if self._by_placeholder.get(m.group(0)) is not None
+        ]
+        if not matches:
+            return list(segments), 0
+        # Start offset of each segment in the buffer, for mapping a match back to
+        # the segment(s) it covers.
+        starts: list[int] = []
+        offset = 0
+        for seg in segments:
+            starts.append(offset)
+            offset += len(seg)
+        parts: list[list[str]] = [[] for _ in segments]
+
+        def emit(lo: int, hi: int) -> None:
+            """Copy ``buffer[lo:hi]`` into the segments that own that range."""
+            while lo < hi:
+                idx = bisect.bisect_right(starts, lo) - 1
+                seg_end = starts[idx] + len(segments[idx])
+                end = min(hi, seg_end)
+                parts[idx].append(buffer[lo:end])
+                lo = end
+
+        cursor = 0
+        for match in matches:
+            emit(cursor, match.start())
+            owner = bisect.bisect_right(starts, match.start()) - 1
+            parts[owner].append(self._by_placeholder[match.group(0)])
+            cursor = match.end()
+        emit(cursor, len(buffer))
+        return ["".join(part) for part in parts], len(matches)
+
 
 class PrivacyFilter:
     """Redact PII in outbound JSON bodies; restore it in response bodies."""
@@ -502,9 +600,10 @@ class PrivacyFilter:
                 if count:
                     text = json.dumps(obj, ensure_ascii=False)
         elif base_ct in ("text/event-stream", "application/x-ndjson"):
-            # SSE/NDJSON payload lines are JSON; keep them parseable when the
-            # original contains quotes or backslashes.
-            text, count = self.cache.restore_text(text, escape=_json_string_escape)
+            # SSE/NDJSON stream a reply token-by-token, so one placeholder can be
+            # split across frames. Reassemble the frames' string values before
+            # matching so a straddling placeholder is still restored.
+            text, count = self._restore_stream(text)
         elif base_ct in ("application/xml", "text/xml"):
             text, count = self.cache.restore_text(text, escape=_xml_escape)
         else:  # other text/*, or no content type at all
@@ -520,6 +619,67 @@ class PrivacyFilter:
             resp.content = text.encode("utf-8")
             self._set_charset(resp, "utf-8")
         flow.metadata["privacy_restored"] = count
+
+    def _restore_stream(self, text: str) -> tuple[str, int]:
+        """Restore placeholders in an SSE/NDJSON body, spanning frame boundaries.
+
+        A streamed reply is chunked token by token, so a single placeholder can
+        arrive split across frames. To match it we reassemble each JSON field
+        *by its path* across all frames (e.g. every frame's
+        ``choices[0].delta.content``) and restore that sequence as one text —
+        never joining unrelated fields, which would both miss real splits (when
+        ``id``/``model`` strings fall between two content deltas) and risk a
+        false match spanning two independent values. Non-JSON lines (SSE
+        ``event:``/``id:`` fields, ``data: [DONE]``, plain-text payloads) are
+        scanned for whole placeholders in place. Only frames that actually
+        changed are re-serialised, so untouched frames keep their exact bytes.
+        """
+        lines = text.split("\n")
+        # Each frame: (line index, data: prefix, parsed obj, [(path, value)...], had CR).
+        frames: list[tuple[int, str, object, list, bool]] = []
+        total = 0
+        for idx, line in enumerate(lines):
+            parsed = _parse_stream_json_line(line.rstrip("\r"))
+            if parsed is None:
+                restored, n = self.cache.restore_text(line)
+                if n:
+                    lines[idx] = restored
+                    total += n
+                continue
+            prefix, obj = parsed
+            pairs = list(_iter_json_string_paths(obj, ()))
+            frames.append((idx, prefix, obj, pairs, line.endswith("\r")))
+
+        # Group each frame's string values by JSON path, preserving frame order.
+        groups: dict[tuple, list[tuple[int, int]]] = {}
+        values: list[list[str]] = []
+        for fi, (_, _, _, pairs, _) in enumerate(frames):
+            values.append([value for _, value in pairs])
+            for pos, (path, _) in enumerate(pairs):
+                groups.setdefault(path, []).append((fi, pos))
+
+        changed: set[int] = set()
+        for refs in groups.values():
+            restored, count = self.cache.restore_segments(
+                [values[fi][pos] for fi, pos in refs]
+            )
+            if not count:
+                continue
+            total += count
+            for (fi, pos), value in zip(refs, restored):
+                if value != values[fi][pos]:
+                    values[fi][pos] = value
+                    changed.add(fi)
+
+        if not total:
+            return text, 0
+        for fi in changed:
+            idx, prefix, obj, _, had_cr = frames[fi]
+            rebuilt = prefix + json.dumps(
+                _rebuild_json_strings(obj, iter(values[fi])), ensure_ascii=False
+            )
+            lines[idx] = rebuilt + "\r" if had_cr else rebuilt
+        return "\n".join(lines), total
 
     def websocket_start(self, flow: http.HTTPFlow) -> None:
         if flow.request is not None and not self._exempt(flow.request):

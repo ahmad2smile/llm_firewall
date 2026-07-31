@@ -347,87 +347,139 @@ _INDEX_HTML = r"""<!doctype html>
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
-<title>llm-firewall · captured flows</title>
+<title>llm-firewall · capture review</title>
+<!-- Webfonts are a progressive enhancement: the stacks below fall back to local
+     faces so the dashboard stays legible offline (or when the browser running it
+     is itself pointed at this proxy). -->
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Archivo+Black&family=IBM+Plex+Mono:wght@400;500;600;700&family=Archivo:wght@400;500;600;700&display=swap">
 <style>
   :root {
-    --bg: #0f1115; --panel: #171a21; --panel2: #1e222b; --border: #2a2f3a;
-    --text: #e6e8ee; --muted: #9aa3b2; --accent: #6ea8fe; --green: #4ec98a;
-    --red: #f2777a; --amber: #e6b35a; --mono: ui-monospace, SFMono-Regular,
-    "SF Mono", Menlo, Consolas, monospace;
+    --bg: #e7e7e4; --panel: #efefec; --list: #ebebe8; --detail: #f1f1ee;
+    --sheet: #ffffff; --hover: #f4f4f1; --ink: #111111; --label: #6e6e69;
+    --hair: #dcdcd7; --line: #111111; --cyanT: #0b7f75; --orangeT: #c14a09;
+    /* Fixed accents — identical in both themes, they carry the brand. */
+    --cyan: #0fd0c0; --orange: #f0651f; --deep: #08312d;
+    --mono: "IBM Plex Mono", ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+    --sans: "Archivo", Helvetica, Arial, sans-serif;
+    --display: "Archivo Black", Helvetica, Arial, sans-serif;
+  }
+  :root[data-theme="dark"] {
+    --bg: #141513; --panel: #1b1c19; --list: #181917; --detail: #1d1e1b;
+    --sheet: #1f201d; --hover: #26271f; --ink: #ecece7; --label: #8f8f88;
+    --hair: #2d2e2a; --line: #3a3b36; --cyanT: #3ad9c9; --orangeT: #ff8f4d;
   }
   * { box-sizing: border-box; }
   body { margin: 0; height: 100vh; display: flex; flex-direction: column;
-    font-family: system-ui, -apple-system, Segoe UI, Roboto, sans-serif;
-    background: var(--bg); color: var(--text); }
-  header { padding: 10px 16px; border-bottom: 1px solid var(--border);
-    display: flex; align-items: center; gap: 14px; background: var(--panel); }
-  header h1 { font-size: 15px; margin: 0; font-weight: 600; letter-spacing: .2px; }
-  header .count { color: var(--muted); font-size: 13px; }
-  #search { flex: 1; max-width: 420px; padding: 7px 11px; border-radius: 7px;
-    border: 1px solid var(--border); background: var(--panel2); color: var(--text);
-    font-size: 13px; }
-  #search::placeholder { color: var(--muted); }
-  button.refresh { background: var(--panel2); color: var(--text); border: 1px solid
-    var(--border); border-radius: 7px; padding: 7px 11px; font-size: 13px; cursor: pointer; }
-  button.refresh:hover { border-color: var(--accent); }
+    font-family: var(--mono); font-size: 13px;
+    background: var(--bg); color: var(--ink); }
+  header { padding: 14px 20px; border-bottom: 1px solid var(--line);
+    display: flex; align-items: center; gap: 18px; background: var(--panel); }
+  header h1 { font-family: var(--display); font-size: 20px; margin: 0; line-height: 1;
+    /* 900 is a no-op for Archivo Black but keeps the fallback face heavy. */
+    letter-spacing: -.02em; font-weight: 900; }
+  header h1 .slash { color: var(--cyan); }
+  header .count { color: var(--label); font-size: 11px; }
+  #search { flex: 1; max-width: 420px; padding: 9px 11px; border: 1px solid var(--line);
+    background: var(--sheet); color: var(--ink); font-family: var(--mono);
+    font-size: 12px; outline: 0; }
+  #search::placeholder { color: #8d8d88; }
+  button { font-family: var(--mono); font-size: 10px; letter-spacing: .18em;
+    text-transform: uppercase; cursor: pointer; }
+  button.theme { margin-left: auto; border: 1px solid var(--line);
+    background: transparent; color: var(--ink); padding: 8px 14px; }
+  button.theme:hover { border-color: var(--cyan); color: var(--cyanT); }
+  button.refresh { border: 0; background: var(--ink); color: var(--bg); padding: 9px 20px; }
+  button.refresh:hover { background: var(--cyan); color: var(--deep); }
   main { flex: 1; display: flex; min-height: 0; }
-  #list { width: 42%; max-width: 560px; min-width: 300px; overflow-y: auto;
-    border-right: 1px solid var(--border); }
-  .row { padding: 9px 14px; border-bottom: 1px solid var(--border); cursor: pointer;
-    display: flex; flex-direction: column; gap: 3px; }
-  .row:hover { background: var(--panel); }
-  .row.active { background: var(--panel2); box-shadow: inset 3px 0 0 var(--accent); }
-  .row .line1 { display: flex; align-items: center; gap: 8px; font-size: 13px; }
-  .row .host { font-weight: 600; overflow: hidden; text-overflow: ellipsis;
+  #list { width: 44%; max-width: 600px; min-width: 320px; overflow-y: auto;
+    border-right: 1px solid var(--line); background: var(--list); }
+  .row { padding: 12px 16px; border-bottom: 1px solid var(--hair); cursor: pointer;
+    display: flex; flex-direction: column; gap: 6px; }
+  .row:hover { background: var(--hover); }
+  /* Active row reads as a lifted sheet with a cyan spine; the compensating left
+     padding keeps its text aligned with the inactive rows above and below. */
+  .row.active { background: var(--sheet); border-bottom-color: var(--line);
+    border-left: 2px solid var(--cyan); padding-left: 14px; }
+  .row .line1 { display: flex; align-items: baseline; gap: 10px; }
+  .row .host { font-family: var(--sans); font-weight: 700; font-size: 14px;
+    letter-spacing: -.01em; overflow: hidden; text-overflow: ellipsis;
     white-space: nowrap; }
-  .row .url { color: var(--muted); font-size: 12px; font-family: var(--mono);
-    overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
-  .method { font-family: var(--mono); font-size: 11px; color: var(--accent); }
-  .status { font-family: var(--mono); font-size: 12px; margin-left: auto; }
-  .status.ok { color: var(--green); } .status.err { color: var(--red); }
-  .badge { font-size: 10px; padding: 1px 6px; border-radius: 10px; font-weight: 600; }
-  .badge.red { background: rgba(78,201,138,.15); color: var(--green); }
-  .badge.rest { background: rgba(110,168,254,.15); color: var(--accent); }
-  .badge.block { background: rgba(242,119,122,.15); color: var(--red); }
-  #detail { flex: 1; overflow-y: auto; padding: 18px 22px; }
-  #detail .empty { color: var(--muted); margin-top: 40px; text-align: center; }
-  #detail h2 { font-size: 14px; margin: 22px 0 8px; color: var(--muted);
-    text-transform: uppercase; letter-spacing: .6px; font-weight: 600; }
-  #detail .title { font-size: 16px; font-family: var(--mono); word-break: break-all; }
-  .meta { display: flex; flex-wrap: wrap; gap: 8px 18px; color: var(--muted);
-    font-size: 13px; margin-top: 6px; }
-  .meta b { color: var(--text); font-weight: 600; }
-  pre { background: var(--panel); border: 1px solid var(--border); border-radius: 8px;
-    padding: 12px; overflow-x: auto; font-family: var(--mono); font-size: 12.5px;
-    line-height: 1.5; margin: 0; white-space: pre-wrap; word-break: break-word; }
-  .cols { display: grid; grid-template-columns: 1fr 1fr; gap: 12px; }
-  .cols .col h3 { font-size: 12px; margin: 0 0 6px; color: var(--muted); font-weight: 600; }
-  .cols .col.before h3 { color: var(--amber); }
-  .cols .col.after h3 { color: var(--green); }
-  ins { background: rgba(78,201,138,.22); text-decoration: none; border-radius: 2px; }
-  del { background: rgba(242,119,122,.22); text-decoration: none; border-radius: 2px; }
-  table.hdr { width: 100%; border-collapse: collapse; font-size: 12.5px;
-    font-family: var(--mono); }
-  table.hdr td { padding: 3px 8px; border-bottom: 1px solid var(--border);
-    vertical-align: top; word-break: break-all; }
-  table.hdr td.k { color: var(--muted); white-space: nowrap; width: 1px; }
-  details { margin-top: 6px; } summary { cursor: pointer; color: var(--muted);
-    font-size: 13px; }
+  .row .url { font-size: 11px; color: var(--label); overflow: hidden;
+    text-overflow: ellipsis; white-space: nowrap; }
+  .method { font-size: 10px; letter-spacing: .14em; color: var(--label); }
+  .status { font-size: 12px; margin-left: auto; color: var(--label); white-space: nowrap; }
+  .status.err { color: var(--orangeT); }
+  .tags { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; }
+  .badge { font-size: 9px; letter-spacing: .14em; text-transform: uppercase; }
+  .badge.red { color: var(--orangeT); }
+  .badge.rest { color: var(--cyanT); }
+  .badge.block { background: var(--ink); color: var(--bg); padding: 1px 6px; }
+  #detail { flex: 1; overflow-y: auto; background: var(--detail);
+    padding: 22px 24px 40px; display: flex; flex-direction: column; gap: 24px; }
+  #detail .empty { color: var(--label); margin-top: 40px; text-align: center; }
+  #detail .title { font-family: var(--sans); font-weight: 700; font-size: 19px;
+    letter-spacing: -.01em; word-break: break-all; line-height: 1.25; }
+  .head { display: flex; flex-direction: column; gap: 8px; }
+  .meta { display: flex; flex-wrap: wrap; gap: 6px 24px; color: var(--label);
+    font-size: 11px; }
+  .meta .red { color: var(--orangeT); } .meta .rest { color: var(--cyanT); }
+  h2 { font-size: 10px; letter-spacing: .22em; text-transform: uppercase;
+    color: var(--label); margin: 0 0 8px; font-weight: 400; }
+  .sheet { border: 1px solid var(--line); background: var(--sheet); min-width: 0; }
+  /* Colour-coded strip: orange = what was on the wire before us, cyan = what we
+     handed on. Same pairing in both body panels, so the eye learns it once. */
+  .strip { padding: 6px 10px; border-bottom: 1px solid var(--line); font-size: 9px;
+    letter-spacing: .18em; text-transform: uppercase; font-weight: 600; }
+  .strip.before { background: var(--orange); color: #fff; }
+  .strip.after { background: var(--cyan); color: var(--deep); }
+  .strip.plain { background: var(--ink); color: var(--bg); }
+  pre { margin: 0; padding: 12px; font-family: var(--mono); font-size: 12px;
+    line-height: 1.55; white-space: pre-wrap; word-break: break-word; overflow-x: auto; }
+  .cols { display: grid; grid-template-columns: 1fr 1fr; gap: 14px; }
+  ins, del { text-decoration: none; }
+  ins { background: rgba(15,208,192,.28); }
+  del { background: rgba(240,101,31,.24); }
+  table.hdr { width: 100%; border-collapse: collapse; font-size: 12px;
+    border-top: 1px solid var(--hair); }
+  table.hdr td { padding: 5px 12px; vertical-align: top; word-break: break-all; }
+  table.hdr td.k { color: var(--label); white-space: nowrap; width: 1px; font-size: 11px; }
+  summary { cursor: pointer; padding: 8px 12px; font-size: 11px; color: var(--label);
+    list-style: none; }
+  summary::-webkit-details-marker { display: none; }
   @media (max-width: 900px) { .cols { grid-template-columns: 1fr; } }
 </style>
 </head>
 <body>
 <header>
-  <h1>llm-firewall</h1>
-  <input id="search" type="search" placeholder="Search by host or URL…" autocomplete="off">
+  <h1>LLM<span class="slash">/</span>FIREWALL</h1>
+  <input id="search" type="search" placeholder="host or url…" autocomplete="off">
   <span class="count" id="count"></span>
-  <button class="refresh" id="refresh">Refresh</button>
+  <button class="theme" id="theme">dark</button>
+  <button class="refresh" id="refresh">refresh</button>
 </header>
 <main>
   <div id="list"></div>
   <div id="detail"><div class="empty">Select a flow to inspect its before/after.</div></div>
 </main>
 <script>
+// Theme is a per-browser preference, so it lives in localStorage rather than on
+// the server (which is stateless and read-only). Applied before the first fetch
+// so there is no flash of the wrong palette.
+const themeEl = document.getElementById("theme");
+function applyTheme(dark) {
+  document.documentElement.dataset.theme = dark ? "dark" : "light";
+  themeEl.textContent = dark ? "light" : "dark";
+}
+let darkMode = false;
+try { darkMode = localStorage.getItem("llmfw-theme") === "dark"; } catch (e) {}
+applyTheme(darkMode);
+themeEl.onclick = () => {
+  darkMode = !darkMode;
+  try { localStorage.setItem("llmfw-theme", darkMode ? "dark" : "light"); } catch (e) {}
+  applyTheme(darkMode);
+};
+
 const listEl = document.getElementById("list");
 const detailEl = document.getElementById("detail");
 const countEl = document.getElementById("count");
@@ -447,6 +499,12 @@ function prettyJSON(text) {
   if (text == null) return text;
   try { return JSON.stringify(JSON.parse(text), null, 2); } catch { return text; }
 }
+// The row already shows the host on its own line, so the second line carries just
+// the path — dropping the redundant scheme+host leaves room for long paths.
+function pathOf(f) {
+  const url = f.url || "";
+  try { const u = new URL(url); return u.pathname + u.search; } catch { return url; }
+}
 
 async function loadFlows() {
   const q = encodeURIComponent(searchEl.value.trim());
@@ -457,20 +515,22 @@ async function loadFlows() {
   for (const f of data.flows) {
     const row = document.createElement("div");
     row.className = "row" + (f.id === activeId ? " active" : "");
-    const statusCls = f.error ? "err" : (f.status >= 400 ? "err" : "ok");
+    const statusCls = (f.error || f.status >= 400) ? " err" : "";
     const statusTxt = f.error ? "ERR" : (f.status ?? "—");
     const badges = [];
     if (f.blocked) badges.push('<span class="badge block">blocked</span>');
-    if (f.redactions) badges.push(`<span class="badge red">−${f.redactions}</span>`);
-    if (f.restored) badges.push(`<span class="badge rest">+${f.restored}</span>`);
+    if (f.redactions) badges.push(`<span class="badge red">${f.redactions} redacted</span>`);
+    if (f.restored) badges.push(`<span class="badge rest">${f.restored} restored</span>`);
+    // A transport error has no status of its own, so surface its text instead of
+    // a badge row — it is the one thing worth reading on a failed flow.
+    if (f.error) badges.push(`<span class="badge red">${esc(f.error)}</span>`);
     row.dataset.id = f.id;
     row.innerHTML =
       `<div class="line1"><span class="method">${esc(f.method||"")}</span>` +
       `<span class="host">${esc(f.host||"—")}</span>` +
-      `<span class="status ${statusCls}">${esc(statusTxt)}</span></div>` +
-      `<div class="url">${esc(f.url||"")}</div>` +
-      (badges.length ? `<div>${badges.join(" ")} <span class="count">${fmtTime(f.timestamp)}</span></div>`
-                     : `<div class="count">${fmtTime(f.timestamp)}</div>`);
+      `<span class="status${statusCls}">${esc(statusTxt)} · ${fmtTime(f.timestamp)}</span></div>` +
+      `<div class="url">${esc(pathOf(f))}</div>` +
+      (badges.length ? `<div class="tags">${badges.join("")}</div>` : "");
     row.onclick = () => {
       activeId = f.id;
       [...listEl.children].forEach(r =>
@@ -481,20 +541,27 @@ async function loadFlows() {
   }
 }
 
-function headerTable(headers) {
-  if (!headers || !headers.length) return "<pre>(none)</pre>";
+function section(label, inner) {
+  return `<div><h2>${label}</h2>${inner}</div>`;
+}
+function headerTable(label, headers) {
+  if (!headers || !headers.length)
+    return section(label, `<div class="sheet"><pre>(none)</pre></div>`);
   const rows = headers.map(([k, v]) =>
     `<tr><td class="k">${esc(k)}</td><td>${esc(v)}</td></tr>`).join("");
-  return `<details><summary>${headers.length} headers</summary>` +
-         `<table class="hdr">${rows}</table></details>`;
+  return section(label,
+    `<details class="sheet"><summary>${headers.length} headers</summary>` +
+    `<table class="hdr"><tbody>${rows}</tbody></table></details>`);
 }
 
-// Word-level diff so redacted spans stand out without pulling in a library.
-function diffTokens(a, b) {
-  const re = /(\s+|\[[A-Z0-9_]+\]|\w+|[^\w\s])/g;
-  const ta = (a||"").match(re) || [], tb = (b||"").match(re) || [];
+// The LCS table is O(n*m) in space and time. A 512KB body tokenizes to ~100k
+// tokens, which would allocate tens of GB and freeze the tab, so cap the region
+// we ever run it on.
+const MAX_DIFF_CELLS = 2_000_000;
+
+// LCS word diff over two token arrays -> [leftHTML, rightHTML].
+function lcsDiff(ta, tb) {
   const n = ta.length, m = tb.length;
-  // LCS table — fine for the modest bodies we deal with here.
   const dp = Array.from({length: n+1}, () => new Int32Array(m+1));
   for (let i = n-1; i >= 0; i--)
     for (let j = m-1; j >= 0; j--)
@@ -510,18 +577,50 @@ function diffTokens(a, b) {
   return [left, right];
 }
 
+// Word-level diff so redacted spans stand out without pulling in a library.
+// Redaction changes are localized, so trim the common prefix/suffix and run the
+// quadratic LCS only on the differing middle — keeps highlighting fast on large
+// bodies where the full table would freeze the page.
+function diffTokens(a, b) {
+  const re = /(\s+|\[[A-Z0-9_]+\]|\w+|[^\w\s])/g;
+  const ta = (a||"").match(re) || [], tb = (b||"").match(re) || [];
+  const n = ta.length, m = tb.length;
+  let pre = 0;
+  while (pre < n && pre < m && ta[pre] === tb[pre]) pre++;
+  let ea = n, eb = m;
+  while (ea > pre && eb > pre && ta[ea-1] === tb[eb-1]) { ea--; eb--; }
+  const head = ta.slice(0, pre).map(esc).join("");
+  const tail = ta.slice(ea).map(esc).join("");
+  const midA = ta.slice(pre, ea), midB = tb.slice(pre, eb);
+  let midL, midR;
+  if (midA.length * midB.length > MAX_DIFF_CELLS) {
+    // Differing region still too large to diff cell-by-cell: show it plainly.
+    midL = midA.map(t => `<del>${esc(t)}</del>`).join("");
+    midR = midB.map(t => `<ins>${esc(t)}</ins>`).join("");
+  } else {
+    [midL, midR] = lcsDiff(midA, midB);
+  }
+  return [head + midL + tail, head + midR + tail];
+}
+
+// One bordered sheet with a colour-coded strip naming which side of the proxy the
+// bytes below came from.
+function panel(kind, strip, inner) {
+  return `<div class="sheet"><div class="strip ${kind}">${strip}</div><pre>${inner}</pre></div>`;
+}
+
 function bodyBlock(label, msg, original, sent, isBase64) {
-  if (isBase64) return `<h2>${label}</h2><pre>${esc(sent||"")} <em>(base64 binary)</em></pre>`;
+  if (isBase64)
+    return section(label, panel("plain", "binary · base64", esc(sent||"")));
   if (original == null) {
     // No privacy change — a single body is all there is to show.
-    if (sent == null || sent === "") return `<h2>${label}</h2><pre>(empty)</pre>`;
-    return `<h2>${label}</h2><pre>${esc(prettyJSON(sent))}</pre>`;
+    const text = (sent == null || sent === "") ? "(empty)" : esc(prettyJSON(sent));
+    return section(label, panel("plain", "unchanged", text));
   }
   const [beforeLbl, afterLbl] = msg;
   const [l, r] = diffTokens(prettyJSON(original), prettyJSON(sent));
-  return `<h2>${label} <span class="count">— before / after</span></h2>` +
-    `<div class="cols"><div class="col before"><h3>${beforeLbl}</h3><pre>${l}</pre></div>` +
-    `<div class="col after"><h3>${afterLbl}</h3><pre>${r}</pre></div></div>`;
+  return section(label,
+    `<div class="cols">${panel("before", beforeLbl, l)}${panel("after", afterLbl, r)}</div>`);
 }
 
 async function loadDetail(id) {
@@ -529,24 +628,24 @@ async function loadDetail(id) {
   const rec = await res.json();
   if (rec.error) { detailEl.innerHTML = `<div class="empty">${esc(rec.error)}</div>`; return; }
   const req = rec.request || {}, resp = rec.response || {};
-  const meta = [];
-  meta.push(`<span><b>${esc(req.method||"")}</b> ${esc(fmtTime(rec.timestamp))}</span>`);
-  if (resp.status_code != null) meta.push(`<span>status <b>${esc(resp.status_code)} ${esc(resp.reason||"")}</b></span>`);
-  if (rec.client) meta.push(`<span>client <b>${esc(rec.client)}</b></span>`);
-  if (rec.privacy_redactions) meta.push(`<span><b>${rec.privacy_redactions}</b> redacted</span>`);
-  if (rec.privacy_restored) meta.push(`<span><b>${rec.privacy_restored}</b> restored</span>`);
-  if (rec.privacy_blocked) meta.push(`<span style="color:var(--red)"><b>BLOCKED</b> (never sent)</span>`);
-  if (rec.error) meta.push(`<span style="color:var(--red)">error: <b>${esc(rec.error)}</b></span>`);
+  // First line reads as one sentence: method · outcome · time.
+  const first = [esc(req.method||"")];
+  if (resp.status_code != null) first.push(`${esc(resp.status_code)} ${esc(resp.reason||"")}`.trim());
+  first.push(fmtTime(rec.timestamp));
+  const meta = [`<span>${first.filter(Boolean).join(" · ")}</span>`];
+  if (rec.client) meta.push(`<span>client ${esc(rec.client)}</span>`);
+  if (rec.privacy_redactions) meta.push(`<span class="red">${rec.privacy_redactions} redacted</span>`);
+  if (rec.privacy_restored) meta.push(`<span class="rest">${rec.privacy_restored} restored</span>`);
+  if (rec.privacy_blocked) meta.push(`<span class="red">blocked · never sent</span>`);
+  if (rec.error) meta.push(`<span class="red">error: ${esc(rec.error)}</span>`);
 
-  let html = `<div class="title">${esc(req.url||"(no request)")}</div>`;
-  html += `<div class="meta">${meta.join("")}</div>`;
-  html += `<h2>Request headers</h2>${headerTable(req.headers)}`;
-  html += bodyBlock("Request body",
-    ["Original (client sent)", "Sent upstream (redacted)"],
+  let html = `<div class="head"><div class="title">${esc(req.url||"(no request)")}</div>` +
+    `<div class="meta">${meta.join("")}</div></div>`;
+  html += headerTable("request headers", req.headers);
+  html += bodyBlock("request body", ["client sent", "sent upstream"],
     req.body_original, req.body, req.body_is_base64);
-  html += `<h2>Response headers</h2>${headerTable(resp.headers)}`;
-  html += bodyBlock("Response body",
-    ["Upstream returned (redacted)", "App saw (restored)"],
+  html += headerTable("response headers", resp.headers);
+  html += bodyBlock("response body", ["upstream returned", "app saw"],
     resp.body_original, resp.body, resp.body_is_base64);
   detailEl.innerHTML = html;
 }
